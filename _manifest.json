@@ -1,0 +1,41 @@
+{
+  "manifest_version": 2,
+  "id": "github.yunshanluan0714.flag-boomerang",
+  "version": "1.1.0",
+  "plugin_type": "extension",
+  "name": "群聊 Flag 回旋镖追踪器",
+  "description": "静默捕获群内立Flag、早睡誓言、戒氪毒誓与放狠话，在熬夜破戒、打脸或到期时自动递出回旋镖；常态零Prompt打扰，严格单群隔离，并尊重深夜静默。",
+  "author": {
+    "name": "yunshanluan0714",
+    "url": "https://github.com/yunshanluan0714"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/yunshanluan0714/maibot-flag-boomerang",
+    "homepage": "https://github.com/yunshanluan0714/maibot-flag-boomerang",
+    "documentation": "https://github.com/yunshanluan0714/maibot-flag-boomerang/blob/main/README.md",
+    "issues": "https://github.com/yunshanluan0714/maibot-flag-boomerang/issues"
+  },
+  "host_application": {
+    "min_version": "1.3.19",
+    "max_version": "1.4.99"
+  },
+  "sdk": {
+    "min_version": "2.20.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "chat.get_all_streams",
+    "config.get",
+    "llm.generate",
+    "maisaka.proactive.trigger",
+    "memory.ingest_text"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}
