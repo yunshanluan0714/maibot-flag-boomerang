@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -52,6 +53,40 @@ class FlagStore:
         conn = sqlite3.connect(str(self._db_path), timeout=10.0)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def pending_manual_names(self) -> list[tuple[str, str]]:
+        with self._lock, closing(self._connect()) as conn:
+            return [
+                (row["group_id"], row["user_name"]) for row in conn.execute(
+                    "SELECT DISTINCT group_id, user_name FROM flags "
+                    "WHERE user_id = 'manual:' || user_name AND status IN ('active', 'due_wait', 'pending_roast')"
+                )
+            ]
+
+    def bind_manual_name(self, group_id: str, name: str, user_id: str) -> None:
+        with self._lock, closing(self._connect()) as conn, conn:
+            conn.execute(
+                "UPDATE flags SET user_id = ? WHERE group_id = ? AND user_id = ? AND status IN ('active', 'due_wait', 'pending_roast')",
+                (user_id, group_id, f"manual:{name}"),
+            )
+
+    def list_known_members(self, group_id: str) -> list[dict[str, str]]:
+        with self._lock, closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, user_name
+                FROM flags
+                WHERE group_id = ? AND user_id != '' AND user_id NOT LIKE 'manual:%'
+                GROUP BY user_id
+                ORDER BY MAX(created_at) DESC
+                """,
+                (group_id,),
+            ).fetchall()
+            return [
+                {"user_id": str(r["user_id"]), "card": str(r["user_name"]), "nickname": str(r["user_name"])}
+                for r in rows
+                if str(r["user_id"] or "").strip()
+            ]
 
     def _init_schema(self) -> None:
         with self._lock:

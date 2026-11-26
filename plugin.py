@@ -1,4 +1,4 @@
-"""Main plugin wiring for github.yunshanluan0714.flag-boomerang v1.1.0."""
+"""Main plugin wiring for github.yunshanluan0714.flag-boomerang v1.0.0."""
 
 from __future__ import annotations
 
@@ -88,8 +88,11 @@ class FlagBoomerangPlugin(MaiBotPlugin):
         self._bot_nickname = ""
         self._session_to_group: dict[str, str] = {}
         self._session_to_private: dict[str, str] = {}
+        self._known_members: dict[str, dict[str, str]] = {}
+        self._member_api_targets: list[tuple[str, str]] | None = None
         self._pending_hints: dict[str, str] = {}
         self._last_group_activity: dict[str, float] = {}
+        self._proactive_inflight: set[str] = set()
         self._last_proactive_at: dict[str, float] = {}
         self._proactive_daily_count: dict[str, tuple[str, int]] = {}
         self._bg_tasks: set[asyncio.Task[Any]] = set()
@@ -100,8 +103,13 @@ class FlagBoomerangPlugin(MaiBotPlugin):
         await self._refresh_bot_identity()
         await self._warm_stream_mappings()
         self._running = True
+        pending = self._store.pending_manual_names()
+        if pending:
+            task = asyncio.create_task(self._bind_legacy_participants(pending))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
         self._deadline_task = asyncio.create_task(self._run_deadline_loop(), name="flag-boomerang-deadline")
-        self.ctx.logger.info("群聊 Flag 回旋镖追踪器 v1.1.0 已加载")
+        self.ctx.logger.info("群聊 Flag 回旋镖追踪器 v1.1.1 已加载")
 
     async def on_unload(self) -> None:
         self._running = False
@@ -118,6 +126,9 @@ class FlagBoomerangPlugin(MaiBotPlugin):
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         del config_data, version
+        for session_id in list(self._pending_hints):
+            if not self._scope_allowed(self._resolve_scope_group_id(session_id)):
+                self._pending_hints.pop(session_id, None)
         self.ctx.logger.info("群聊 Flag 回旋镖配置已热更新: scope=%s", scope)
 
     async def _refresh_bot_identity(self) -> None:
@@ -187,6 +198,134 @@ class FlagBoomerangPlugin(MaiBotPlugin):
             return False
         return True
 
+    def _scope_allowed(self, group_id: str) -> bool:
+        return bool(group_id) and self._is_scope_enabled(group_id=group_id, is_private=group_id.startswith("private:"))
+
+    async def _discover_member_api_targets(self) -> list[tuple[str, str]]:
+        if self._member_api_targets is not None:
+            return self._member_api_targets
+        defaults: list[tuple[str, str]] = [
+            ("call_data", "maibot-team.snowluma-adapter.adapter.snowluma.action.call_data"),
+            ("call_data", "maibot-team.snowluma-adapter.adapter.napcat.action.call_data"),
+            ("call_data", "maibot-team.snowluma-adapter.adapter.onebot.action.call_data"),
+        ]
+        list_fn = getattr(getattr(self.ctx, "api", None), "list", None)
+        if not callable(list_fn):
+            self._member_api_targets = defaults
+            return self._member_api_targets
+        try:
+            payload = await list_fn()
+        except Exception:
+            self._member_api_targets = defaults
+            return self._member_api_targets
+        items = payload.get("apis", []) if isinstance(payload, dict) else (payload if isinstance(payload, list) else [])
+        discovered: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for kind, suffix in (
+            ("call_data", "action.call_data"),
+            ("call", "action.call"),
+            ("direct", "get_group_member_list"),
+        ):
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                pid = str(entry.get("plugin_id") or "").strip()
+                name = str(entry.get("name") or "").strip()
+                if not pid or not name:
+                    continue
+                if name == suffix or name.endswith("." + suffix):
+                    full = name if name.startswith(pid + ".") else f"{pid}.{name}"
+                    pair = (kind, full)
+                    if pair not in seen:
+                        seen.add(pair)
+                        discovered.append(pair)
+        self._member_api_targets = discovered or defaults
+        return self._member_api_targets
+
+    @staticmethod
+    def _unwrap_member_list(resp: Any) -> list[dict[str, Any]]:
+        if isinstance(resp, dict):
+            if resp.get("success") is False:
+                return []
+            if "result" in resp:
+                resp = resp["result"]
+            if isinstance(resp, dict) and "data" in resp:
+                resp = resp["data"]
+        return [m for m in resp if isinstance(m, dict)] if isinstance(resp, list) else []
+
+    def _local_known_members(self, group_id: str) -> list[dict[str, str]]:
+        by_uid: dict[str, dict[str, str]] = {}
+        if self._store is not None:
+            for item in self._store.list_known_members(group_id):
+                uid = str(item.get("user_id") or "").strip()
+                if uid:
+                    by_uid[uid] = item
+        for uid, uname in self._known_members.get(group_id, {}).items():
+            if uid:
+                by_uid[uid] = {"user_id": uid, "card": uname, "nickname": uname}
+        return list(by_uid.values())
+
+    async def _group_members(self, group_id: str) -> list:
+        api_cap = getattr(self.ctx, "api", None)
+        call_fn = getattr(api_cap, "call", None)
+        if callable(call_fn):
+            targets = await self._discover_member_api_targets()
+            for kind, api_name in targets:
+                try:
+                    if kind == "direct":
+                        resp = await call_fn(api_name, group_id=group_id)
+                    else:
+                        resp = await call_fn(
+                            api_name,
+                            action_name="get_group_member_list",
+                            params={"group_id": group_id},
+                        )
+                except Exception:
+                    continue
+                members = self._unwrap_member_list(resp)
+                if members:
+                    return members
+        return self._local_known_members(group_id)
+
+    async def _manual_participant(
+        self, group_id: str, target: str, sender_id: str, members: list | None = None
+    ) -> tuple[str, str] | None:
+        target = target.strip()
+        if group_id.startswith("private:"):
+            uid = group_id.removeprefix("private:")
+            if target.isdigit() and target != uid:
+                return None
+            return uid, target or uid
+        if sender_id and (not target or target == sender_id):
+            return sender_id, sender_id
+        if not target:
+            return None
+        if members is None:
+            members = await self._group_members(group_id)
+        matches = {}
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            uid = str(member.get("user_id") or "").strip()
+            card = str(member.get("card") or "").strip()
+            nickname = str(member.get("nickname") or "").strip()
+            if uid and target == uid:
+                return uid, card or nickname or uid
+            if uid and target in (card, nickname):
+                matches[uid] = card or nickname or uid
+        return next(iter(matches.items())) if len(matches) == 1 else None
+
+    async def _bind_legacy_participants(self, pending: list[tuple[str, str]]) -> None:
+        members_by_group = {}
+        for group_id, name in pending:
+            if not self._scope_allowed(group_id):
+                continue
+            if not group_id.startswith("private:") and group_id not in members_by_group:
+                members_by_group[group_id] = await self._group_members(group_id)
+            person = await self._manual_participant(group_id, name, "", members_by_group.get(group_id))
+            if person and self._store and self._scope_allowed(group_id):
+                self._store.bind_manual_name(group_id, name, person[0])
+
     def _now_dt(self, now_ts: float | None = None) -> datetime:
         tz = resolve_tz(self.config.trigger.timezone)
         if now_ts is None:
@@ -195,7 +334,7 @@ class FlagBoomerangPlugin(MaiBotPlugin):
 
     def _can_proactive_in_group(self, group_id: str, now_dt: datetime) -> bool:
         cfg = self.config.trigger
-        if cfg.proactive_daily_limit_per_group <= 0:
+        if not self._scope_allowed(group_id) or group_id in self._proactive_inflight or cfg.proactive_daily_limit_per_group <= 0:
             return False
         if in_quiet_hours(now_dt, cfg.quiet_start, cfg.quiet_end):
             return False
@@ -281,6 +420,8 @@ class FlagBoomerangPlugin(MaiBotPlugin):
             return
         now_ts = time.time()
         self._last_group_activity[scope_group_id] = now_ts
+        if not is_private and sender_name:
+            self._known_members.setdefault(scope_group_id, {})[user_id] = sender_name
 
         task = asyncio.create_task(
             self._process_incoming_message(
@@ -307,7 +448,7 @@ class FlagBoomerangPlugin(MaiBotPlugin):
         plain_text: str,
         now_ts: float,
     ) -> None:
-        if self._store is None:
+        if self._store is None or not self._scope_allowed(scope_group_id):
             return
         cfg = self.config
         now_dt = self._now_dt(now_ts)
@@ -377,16 +518,19 @@ class FlagBoomerangPlugin(MaiBotPlugin):
                                 busted_at=now_ts,
                                 reason="超出早睡截止时间仍在发言",
                             )
+                            if not self._scope_allowed(scope_group_id):
+                                return
                             self._pending_hints[session_id] = self._format_roast_hint(
                                 flag,
                                 kind="sleep_bust",
                                 new_text=clean_text,
                             )
-                            await self._maybe_proactive_roast(
+                            await self._trigger_proactive(
                                 scope_group_id=scope_group_id,
                                 session_id=session_id,
                                 hint=self._pending_hints[session_id],
                                 now_dt=now_dt,
+                                reason="flag_boomerang_bust",
                             )
                         busted_now = True
                         break
@@ -408,6 +552,8 @@ class FlagBoomerangPlugin(MaiBotPlugin):
                             confirmed = False
                         elif llm_reason:
                             reason = llm_reason
+                    if not self._scope_allowed(scope_group_id):
+                        return
                     if confirmed:
                         self._store.mark_busted(
                             flag.id,
@@ -422,6 +568,8 @@ class FlagBoomerangPlugin(MaiBotPlugin):
                             reason=reason,
                             llm_outrageous=llm_outrageous,
                         )
+                        if not self._scope_allowed(scope_group_id):
+                            return
                         if not quiet:
                             self._pending_hints[session_id] = self._format_roast_hint(
                                 flag,
@@ -440,6 +588,8 @@ class FlagBoomerangPlugin(MaiBotPlugin):
                 parsed = None
                 if cfg.capture.use_llm_verification:
                     parsed = await self._extract_flag_with_llm(sender_name, clean_text, cand, now_dt)
+                if not self._scope_allowed(scope_group_id):
+                    return
                 if parsed is None:
                     parsed = fallback_parse_candidate(cand, now_dt)
                 if parsed.is_flag and parsed.confidence >= float(cfg.capture.min_confidence):
@@ -513,7 +663,7 @@ class FlagBoomerangPlugin(MaiBotPlugin):
         reason: str = "",
         llm_outrageous: bool | None = None,
     ) -> bool:
-        if self._store is None or flag.memory_saved:
+        if self._store is None or flag.memory_saved or not self._scope_allowed(flag.group_id):
             return False
         cfg = self.config.trigger
         if not cfg.save_outrageous_to_memory:
@@ -566,25 +716,22 @@ class FlagBoomerangPlugin(MaiBotPlugin):
             self.ctx.logger.debug("写入离谱打脸长期记忆跳过: id=%d err=%s", flag.id, type(exc).__name__)
         return False
 
-    async def _maybe_proactive_roast(
-        self,
-        *,
-        scope_group_id: str,
-        session_id: str,
-        hint: str,
-        now_dt: datetime,
-    ) -> None:
+    async def _trigger_proactive(
+        self, *, scope_group_id: str, session_id: str, hint: str, now_dt: datetime, reason: str
+    ) -> bool:
         if not session_id or not self._can_proactive_in_group(scope_group_id, now_dt):
-            return
+            return False
+        self._proactive_inflight.add(scope_group_id)
         try:
-            self._mark_proactive_sent(scope_group_id, now_dt)
-            await self.ctx.maisaka.proactive.trigger(
-                stream_id=session_id,
-                intent=hint,
-                reason="flag_boomerang_bust",
-            )
+            result = await self.ctx.maisaka.proactive.trigger(stream_id=session_id, intent=hint, reason=reason)
+            accepted = result is True or (isinstance(result, dict) and result.get("success") is True)
+            if accepted:
+                self._mark_proactive_sent(scope_group_id, now_dt)
+            return accepted
         except Exception:
-            pass
+            return False
+        finally:
+            self._proactive_inflight.discard(scope_group_id)
 
     @HookHandler(
         "maisaka.planner.before_request",
@@ -604,7 +751,7 @@ class FlagBoomerangPlugin(MaiBotPlugin):
             return unchanged
         session_id = str(kwargs.get("session_id") or "").strip()
         hint = self._pending_hints.pop(session_id, "")
-        if not hint:
+        if not hint or not self._scope_allowed(self._resolve_scope_group_id(session_id)):
             return unchanged
         updated = dict(kwargs)
         updated["items"] = _inject_reminder(items, hint)
@@ -632,20 +779,15 @@ class FlagBoomerangPlugin(MaiBotPlugin):
 
         due_items = self._store.find_due_flags(now)
         for flag in due_items:
+            if not self._scope_allowed(flag.group_id):
+                continue
             last_act = self._last_group_activity.get(flag.group_id, 0.0)
             active_recently = last_act > 0.0 and (now - last_act <= 24 * 3600)
-            if active_recently and flag.session_id and self._can_proactive_in_group(flag.group_id, now_dt):
-                hint = self._format_roast_hint(flag, kind="due")
-                try:
-                    self._mark_proactive_sent(flag.group_id, now_dt)
-                    self._store.mark_reminded(flag.id)
-                    await self.ctx.maisaka.proactive.trigger(
-                        stream_id=flag.session_id,
-                        intent=hint,
-                        reason="flag_boomerang_due",
-                    )
-                except Exception:
-                    self._store.mark_due_wait(flag.id)
+            if active_recently and await self._trigger_proactive(
+                scope_group_id=flag.group_id, session_id=flag.session_id,
+                hint=self._format_roast_hint(flag, kind="due"), now_dt=now_dt, reason="flag_boomerang_due",
+            ):
+                self._store.mark_reminded(flag.id)
             else:
                 self._store.mark_due_wait(flag.id)
 
@@ -691,11 +833,12 @@ class FlagBoomerangPlugin(MaiBotPlugin):
         stream_id: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
-        del kwargs
         if self._store is None:
             return {"success": False, "content": "Flag 仓库尚未初始化。"}
-        group_id = self._resolve_scope_group_id(stream_id)
-        if not group_id:
+        group_id = self._resolve_scope_group_id(
+            stream_id, explicit_group_id=str(kwargs.get("group_id") or ""), user_id=str(kwargs.get("user_id") or "")
+        )
+        if not stream_id or not self._scope_allowed(group_id):
             return {"success": False, "content": "无法确认当前所属聊天，出于群隔离限制拒绝查询。"}
 
         rows = self._store.list_flags(
@@ -744,7 +887,7 @@ class FlagBoomerangPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="user_name",
                 param_type=ToolParamType.STRING,
-                description="record 时立 Flag 的群友昵称",
+                description="record 时的群友 QQ 号或唯一昵称；私聊可留空",
                 required=False,
             ),
             ToolParameterInfo(
@@ -779,11 +922,12 @@ class FlagBoomerangPlugin(MaiBotPlugin):
         stream_id: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
-        del kwargs
         if self._store is None:
             return {"success": False, "content": "Flag 仓库尚未初始化。"}
-        group_id = self._resolve_scope_group_id(stream_id)
-        if not group_id:
+        group_id = self._resolve_scope_group_id(
+            stream_id, explicit_group_id=str(kwargs.get("group_id") or ""), user_id=str(kwargs.get("user_id") or "")
+        )
+        if not stream_id or not self._scope_allowed(group_id):
             return {"success": False, "content": "无法确认当前所属聊天，出于群隔离限制拒绝修改。"}
 
         act = str(action or "").strip().lower()
@@ -799,22 +943,30 @@ class FlagBoomerangPlugin(MaiBotPlugin):
 
         if act == "record":
             clean_content = sanitize_incoming_text(content)
-            who = str(user_name or "群友").strip()[:32]
+            person = await self._manual_participant(group_id, str(user_name or ""), str(kwargs.get("user_id") or ""))
+            if not person or not self._scope_allowed(group_id):
+                return {"success": False, "content": "无法唯一确认当前会话的成员，请提供当事人的 QQ 号。"}
+            participant_id, who = person
             if not clean_content:
                 return {"success": False, "content": "请提供要记录的 Flag 具体内容。"}
             cat = category if category in ("sleep_vow", "spend_gacha_vow", "deadline_goal", "bold_prediction") else "deadline_goal"
             now_dt = self._now_dt()
             dl_ts = parse_chinese_deadline(f"{deadline_text} {clean_content}", now_dt)
+            cand = prefilter_flag_candidate(clean_content, now_dt)
+            parsed = fallback_parse_candidate(cand, now_dt) if cand is not None else None
             rec, _ = self._store.add_flag(
                 group_id=group_id,
                 session_id=stream_id,
-                user_id=f"manual:{who}",
+                user_id=participant_id,
                 user_name=who,
                 original_text=clean_content,
                 summary=clean_content[:50],
                 category=cat,
                 created_at=now_dt.timestamp(),
                 deadline_ts=dl_ts,
+                sleep_cutoff_ts=parsed.sleep_cutoff_ts if parsed and cat == "sleep_vow" else None,
+                sleep_window_end_ts=parsed.sleep_window_end_ts if parsed and cat == "sleep_vow" else None,
+                bust_keywords=parsed.bust_keywords if parsed and parsed.category == cat else (),
                 confidence=0.95,
                 max_active_per_user=self.config.capture.max_active_per_user,
             )

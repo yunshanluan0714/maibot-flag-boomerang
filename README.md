@@ -1,4 +1,4 @@
-# `maibot-flag-boomerang`（`github.yunshanluan0714.flag-boomerang`） (v1.1.0) — 群聊 Flag 回旋镖追踪器
+# `maibot-flag-boomerang`（`github.yunshanluan0714.flag-boomerang`） (v1.1.1) — 群聊 Flag 回旋镖追踪器
 
 平时**零存在感静默记账**、常态 **0 Prompt 干扰**，只在群友立下早睡誓言、戒氪毒誓、限时 Flag 或毒奶狠话后真的破戒或到期时，顺手精准递出“回旋镖”；**特别离谱的打脸名场面还支持自动写入 MaiBot 原生长期记忆与向量库**。
 
